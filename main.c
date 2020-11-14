@@ -10,14 +10,14 @@
 #include <sys/wait.h>
 #include <sys/sendfile.h>
 
-#define PORT 80
+#define PORT 8080
 #define MAX_DOCUMENT_ROOT_NAME 256
 #define MAX_BUFFER_SIZE 500
 #define SERVER_NAME "C-Webserver"
 
 char document_root[MAX_DOCUMENT_ROOT_NAME];
 
-int preforks;
+int num_preforks;
 
 pid_t *child_pids;
 
@@ -42,7 +42,7 @@ void handle_SIGCHILD(int signal) {
 void handle_kill(int signal) {
     if (parent_pid != getpid())
         return;
-    for (int i = 0; i < preforks; ++i)
+    for (int i = 0; i < num_preforks; ++i)
         kill(child_pids[i], 9);
 }
 
@@ -54,12 +54,12 @@ int main(int argc, char *argv[]) {
     strncpy(document_root, argv[1], MAX_DOCUMENT_ROOT_NAME);
     document_root[MAX_DOCUMENT_ROOT_NAME - 1] = 0;
 
-    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_fd == -1)
+    int server_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket_fd == -1)
         perror_exit("Generate socket");
 
     int optval_true = 1;
-    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &optval_true, sizeof(optval_true)) == -1)
+    if (setsockopt(server_socket_fd, SOL_SOCKET, SO_REUSEADDR, &optval_true, sizeof(optval_true)) == -1)
         perror_exit("Set socket SO_REUSEADDR");
 
     const struct sockaddr_in host_address = {
@@ -69,30 +69,31 @@ int main(int argc, char *argv[]) {
             .sin_zero={0}
     };
 
-    if (bind(socket_fd, (const struct sockaddr *) &host_address, sizeof(struct sockaddr)) == -1)
+    if (bind(server_socket_fd, (const struct sockaddr *) &host_address, sizeof(struct sockaddr)) == -1)
         perror_exit("Bind socket");
 
     // backlog <= /proc/sys/net/core/somaxconn
-    if (listen(socket_fd, atoi(argv[2])) == -1)
+    if (listen(server_socket_fd, atoi(argv[2])) == -1)
         perror_exit("Listen socket");
 
     signal(SIGCHLD, handle_SIGCHILD);
     signal(SIGTERM, handle_kill);
     signal(SIGINT, handle_kill);
+    signal(SIGPIPE, SIG_IGN);
 
     printf("Startup "SERVER_NAME"\n");
 
-    preforks = atoi(argv[3]);
+    int preforks = atoi(argv[3]);
     child_pids = malloc(sizeof(pid_t) * preforks);
     parent_pid = getpid();
-    for (int i = 0; i < preforks; ++i) {
+    for (num_preforks = 0; num_preforks < preforks;) {
         pid_t pid = fork();
         if (pid == 0)
-            child_doing(socket_fd);
+            child_doing(server_socket_fd);
         else if (pid == -1)
             perror_exit("Fork");
         else
-            child_pids[i] = pid;
+            child_pids[++num_preforks] = pid;
     }
     waitid(P_ALL, 0, NULL, WEXITED);
 
@@ -141,6 +142,7 @@ void exchange_connection(int socket_fd) {
     char file_length_str[20];
     if (file_fd == -1 || (file_length = get_file_size(file_fd)) == -1)
         send_str(socket_fd, "HTTP/1.0 404 Not Found\r\n"
+                            "Server: "SERVER_NAME"\r\n"
                             "Connection: close\r\n"
                             "Content-Length: 80\r\n\r\n"
                             "<html><head><title>404 Not Found</title></head><body>404 Not Found</body></html>");
