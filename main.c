@@ -7,8 +7,8 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
-#include <sys/wait.h>
 #include <sys/sendfile.h>
+#include <pthread.h>
 
 #define PORT 8080
 #define MAX_DOCUMENT_ROOT_NAME 256
@@ -17,11 +17,7 @@
 
 char document_root[MAX_DOCUMENT_ROOT_NAME];
 
-int num_preforks;
-
-pid_t *child_pids;
-
-pid_t parent_pid;
+int server_socket_fd;
 
 void perror_exit(const char *str);
 
@@ -33,28 +29,17 @@ void exchange_connection(int socket_fd);
 
 off_t get_file_size(int fd);
 
-void child_doing(int socket_fd);
-
-void handle_SIGCHILD(int signal) {
-    while (waitpid(-1, NULL, WNOHANG) > 0);
-}
-
-void handle_kill(int signal) {
-    if (parent_pid != getpid())
-        return;
-    for (int i = 0; i < num_preforks; ++i)
-        kill(child_pids[i], 9);
-}
+void *child_doing(void *args);
 
 int main(int argc, char *argv[]) {
     if (argc != 4) {
-        fprintf(stderr, "usage: %s <document root> <back log que> <preforks>\n", argv[0]);
+        fprintf(stderr, "usage: %s <document root> <back log que> <threads>\n", argv[0]);
         return 0;
     }
     strncpy(document_root, argv[1], MAX_DOCUMENT_ROOT_NAME);
     document_root[MAX_DOCUMENT_ROOT_NAME - 1] = 0;
 
-    int server_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    server_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket_fd == -1)
         perror_exit("Generate socket");
 
@@ -76,36 +61,26 @@ int main(int argc, char *argv[]) {
     if (listen(server_socket_fd, atoi(argv[2])) == -1)
         perror_exit("Listen socket");
 
-    signal(SIGCHLD, handle_SIGCHILD);
-    signal(SIGTERM, handle_kill);
-    signal(SIGINT, handle_kill);
     signal(SIGPIPE, SIG_IGN);
 
     printf("Startup "SERVER_NAME"\n");
 
-    int preforks = atoi(argv[3]);
-    child_pids = malloc(sizeof(pid_t) * preforks);
-    parent_pid = getpid();
-    for (num_preforks = 0; num_preforks < preforks;) {
-        pid_t pid = fork();
-        if (pid == 0)
-            child_doing(server_socket_fd);
-        else if (pid == -1)
-            perror_exit("Fork");
-        else
-            child_pids[++num_preforks] = pid;
-    }
-    waitid(P_ALL, 0, NULL, WEXITED);
+    int threads = atoi(argv[3]);
+    pthread_t pthread;
+    for (int i = 0; i < threads; ++i)
+        pthread_create(&pthread, NULL, child_doing, NULL);
+
+    pthread_join(pthread, NULL);
 
     return 1;
 }
 
-void child_doing(int socket_fd) {
+void *child_doing(void *args) {
     while (1) {
         int client_socket_fd;
         struct sockaddr_in client_address;
         socklen_t sockaddr_in_len = sizeof(struct sockaddr_in);
-        if ((client_socket_fd = accept(socket_fd, (struct sockaddr *) &client_address, &sockaddr_in_len)) == -1)
+        if ((client_socket_fd = accept(server_socket_fd, (struct sockaddr *) &client_address, &sockaddr_in_len)) == -1)
             perror_exit("Accept connection");
 
         exchange_connection(client_socket_fd);
@@ -118,7 +93,7 @@ void exchange_connection(int socket_fd) {
     const char default_file_name[] = "index.html";
     receive_line(socket_fd, request_buffer, MAX_BUFFER_SIZE - 10 - 1);
     if ((buffer_pointer = strstr(request_buffer, " HTTP/")) == 0) {
-        shutdown(socket_fd, SHUT_RDWR);
+        close(socket_fd);
         return;
     }
 
@@ -128,7 +103,7 @@ void exchange_connection(int socket_fd) {
     else if (strncmp(request_buffer, "HEAD ", 5) == 0)
         buffer_pointer = request_buffer + 5;
     else {
-        shutdown(socket_fd, SHUT_RDWR);
+        close(socket_fd);
         return;
     }
 
